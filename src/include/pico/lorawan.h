@@ -62,9 +62,15 @@ int lorawan_process_timeout_ms(uint32_t timeout_ms);
 
 int lorawan_send_unconfirmed(const void* data, uint8_t data_len, uint8_t app_port);
 
+int lorawan_send_confirmed(const void* data, uint8_t data_len, uint8_t app_port);
+
+int lorawan_send_confirmed_wait(const void* data, uint8_t data_len, uint8_t app_port, uint32_t timeout_ms);
+
 int lorawan_receive(void* data, uint8_t data_len, uint8_t* app_port);
 
 void lorawan_debug(bool debug);
+
+int lorawan_set_confirmed_retry_count(uint8_t retry_count);
 
 int lorawan_erase_nvm();
 

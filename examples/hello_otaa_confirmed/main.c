@@ -59,6 +59,14 @@ int main( void )
     // uncomment next line to enable debug
     // lorawan_debug(true);
 
+    // Set confirmed message retry count (1-15, default is usually 8)
+    // This means the message will be sent up to 3 times if no ACK is received
+    if (lorawan_set_confirmed_retry_count(3) < 0) {
+        printf("Failed to set retry count\n");
+    } else {
+        printf("Set confirmed retry count to 3\n");
+    }
+
     // initialize the LoRaWAN stack
     printf("Initilizating LoRaWAN ... ");
     if (lorawan_init_otaa(&sx1276_settings, LORAWAN_REGION, &otaa_settings) < 0) {
@@ -93,9 +101,9 @@ int main( void )
         if ((now - last_message_time) > 5000) {
             const char* message = "hello world!";
 
-            // try to send an unconfirmed uplink message
-            printf("sending unconfirmed message '%s' ... ", message);
-            if (lorawan_send_unconfirmed(message, strlen(message), 2) < 0) {
+            // try to send a confirmed uplink message
+            printf("sending confirmed message '%s' ... ", message);
+            if (lorawan_send_confirmed(message, strlen(message), 2) < 0) {
                 printf("failed!!!\n");
             } else {
                 printf("success!\n");

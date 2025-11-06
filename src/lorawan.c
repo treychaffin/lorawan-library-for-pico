@@ -41,6 +41,7 @@
 #include "LmhpCompliance.h"
 #include "LmHandlerMsgDisplay.h"
 #include "NvmDataMgmt.h"
+#include "LoRaMac.h"
 
 /*!
  * LoRaWAN default end-device class
@@ -165,6 +166,8 @@ static LmhpComplianceParams_t LmhpComplianceParams =
 static volatile uint8_t IsMacProcessPending = 0;
 
 static volatile uint32_t TxPeriodicity = 0;
+
+static volatile bool LastConfirmedMessageAcked = false;
 
 static const struct lorawan_abp_settings* AbpSettings = NULL;
 
@@ -327,6 +330,46 @@ int lorawan_send_unconfirmed(const void* data, uint8_t data_len, uint8_t app_por
     return 0;
 }
 
+int lorawan_send_confirmed(const void* data, uint8_t data_len, uint8_t app_port)
+{
+    LmHandlerAppData_t appData;
+
+    appData.Port = app_port;
+    appData.BufferSize = data_len;
+    appData.Buffer = (uint8_t*)data;
+
+    if (LmHandlerSend(&appData, LORAMAC_HANDLER_CONFIRMED_MSG) != LORAMAC_HANDLER_SUCCESS) {
+        return -1;
+    }
+
+    return 0;
+}
+
+int lorawan_send_confirmed_wait(const void* data, uint8_t data_len, uint8_t app_port, uint32_t timeout_ms)
+{
+    LmHandlerAppData_t appData;
+
+    appData.Port = app_port;
+    appData.BufferSize = data_len;
+    appData.Buffer = (uint8_t*)data;
+
+    // Reset confirmation status
+    LastConfirmedMessageAcked = false;
+
+    if (LmHandlerSend(&appData, LORAMAC_HANDLER_CONFIRMED_MSG) != LORAMAC_HANDLER_SUCCESS) {
+        return -1;
+    }
+
+    // Wait for confirmation with timeout
+    absolute_time_t timeout_time = make_timeout_time_ms(timeout_ms);
+    do {
+        lorawan_process();
+        sleep_ms(10);
+    } while (!LastConfirmedMessageAcked && !best_effort_wfe_or_timeout(timeout_time));
+
+    return LastConfirmedMessageAcked ? 0 : -2; // -2 means timeout/no ACK
+}
+
 int lorawan_receive(void* data, uint8_t data_len, uint8_t* app_port)
 {
     *app_port = AppRxData.Port;
@@ -349,6 +392,25 @@ int lorawan_receive(void* data, uint8_t data_len, uint8_t* app_port)
 void lorawan_debug(bool debug)
 {
     Debug = debug;
+}
+
+int lorawan_set_confirmed_retry_count(uint8_t retry_count)
+{
+    MibRequestConfirm_t mibReq;
+    
+    // NbTrans should be between 1 and 15 according to LoRaWAN spec
+    if (retry_count < 1 || retry_count > 15) {
+        return -1;
+    }
+    
+    mibReq.Type = MIB_CHANNELS_NB_TRANS;
+    mibReq.Param.ChannelsNbTrans = retry_count;
+    
+    if (LoRaMacMibSetRequestConfirm(&mibReq) != LORAMAC_STATUS_OK) {
+        return -1;
+    }
+    
+    return 0;
 }
 
 int lorawan_erase_nvm()
@@ -591,6 +653,11 @@ static void OnTxData( LmHandlerTxParams_t* params )
     if (Debug) {
         DisplayTxUpdate( params );
     }
+    
+    // Track if the last confirmed message was acknowledged
+    if (params->IsMcpsConfirm == 1) {
+        LastConfirmedMessageAcked = (params->AckReceived == 1);
+    }
 }
 
 static void OnRxData( LmHandlerAppData_t* appData, LmHandlerRxParams_t* params )
@@ -599,9 +666,17 @@ static void OnRxData( LmHandlerAppData_t* appData, LmHandlerRxParams_t* params )
         DisplayRxUpdate( appData, params );
     }
 
-    memcpy(AppRxData.Buffer, appData->Buffer, appData->BufferSize);
-    AppRxData.BufferSize = appData->BufferSize;
-    AppRxData.Port = appData->Port;
+    // Handle regular application data
+    if (appData->BufferSize > 0) {
+        memcpy(AppRxData.Buffer, appData->Buffer, appData->BufferSize);
+        AppRxData.BufferSize = appData->BufferSize;
+        AppRxData.Port = appData->Port;
+    }
+    
+    // Track ACK reception for confirmed messages
+    if (params->RxSlot != RX_SLOT_NONE) {
+        LastConfirmedMessageAcked = true;
+    }
 }
 
 static void OnClassChange( DeviceClass_t deviceClass )
