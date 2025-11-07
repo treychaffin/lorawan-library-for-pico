@@ -12,3 +12,9 @@ _deps
 
 build/
 
+logs/*
+logs
+
+.vscode/*
+.vscode
+pico_sdk_import.cmake
