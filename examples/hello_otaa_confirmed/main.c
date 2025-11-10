@@ -18,18 +18,18 @@
 // edit with LoRaWAN Node Region and OTAA settings 
 #include "config.h"
 
-// pin configuration for SX1276 radio module
+// pin configuration for SX1276 radio module - CORRECT Adalogger SPI pins
 const struct lorawan_sx1276_settings sx1276_settings = {
     .spi = {
-        .inst = PICO_DEFAULT_SPI_INSTANCE(),
-        .mosi = PICO_DEFAULT_SPI_TX_PIN,
-        .miso = PICO_DEFAULT_SPI_RX_PIN,
-        .sck  = PICO_DEFAULT_SPI_SCK_PIN,
-        .nss  = 10
+        .inst = spi1,   // Adalogger uses SPI1 for these pins
+        .mosi = 15,     // GPIO15 = MOSI on Adalogger
+        .miso = 8,      // GPIO8 = MISO on Adalogger
+        .sck  = 14,     // GPIO14 = SCK on Adalogger
+        .nss  = 10      // Keep NSS the same (any GPIO works)
     },
-    .reset = 11,
-    .dio0  = 6,
-    .dio1  = 5
+    .reset = 11,        // Keep reset the same
+    .dio0  = 6,         // Keep DIO0 the same
+    .dio1  = 5          // Keep DIO1 the same
 };
 
 // OTAA settings
@@ -69,6 +69,15 @@ int main( void )
 
     // initialize the LoRaWAN stack
     printf("Initilizating LoRaWAN ... ");
+    // printf("[LoRa Debug] sx1276_settings: spi.inst=%p, MOSI=%u, MISO=%u, SCK=%u, NSS=%u, RESET=%u, DIO0=%u, DIO1=%u\n",
+    //     sx1276_settings.spi.inst,
+    //     sx1276_settings.spi.mosi,
+    //     sx1276_settings.spi.miso,
+    //     sx1276_settings.spi.sck,
+    //     sx1276_settings.spi.nss,
+    //     sx1276_settings.reset,
+    //     sx1276_settings.dio0,
+    //     sx1276_settings.dio1);
     if (lorawan_init_otaa(&sx1276_settings, LORAWAN_REGION, &otaa_settings) < 0) {
         printf("failed!!!\n");
         while (1) {
