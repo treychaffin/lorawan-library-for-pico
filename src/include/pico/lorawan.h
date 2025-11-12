@@ -74,6 +74,20 @@ int lorawan_set_confirmed_retry_count(uint8_t retry_count);
 
 int lorawan_erase_nvm();
 
+// Diagnostics / accessors
+// Returns 0 on success, -1 on failure
+int lorawan_get_devaddr(uint32_t* devaddr);
+// Gets current ADR enabled state from the MAC (1 enabled, 0 disabled); returns 0 on success
+int lorawan_get_adr_enabled(int* adr_enabled);
+// Returns 1 if the last confirmed uplink was acknowledged, else 0
+int lorawan_last_ack_received(void);
+
+// FreeRTOS-specific API extensions (only available when compiled into a FreeRTOS-enabled target)
+#ifdef USE_FREERTOS
+int lorawan_join_freertos(uint32_t timeout_ms);
+int lorawan_send_freertos(const void* data, size_t data_len, uint8_t app_port, bool confirmed, uint32_t timeout_ms);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

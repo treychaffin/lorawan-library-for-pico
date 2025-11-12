@@ -28,7 +28,16 @@
 #include <string.h>
 
 #include "pico/lorawan.h"
+
+#if USE_FREERTOS
+#include "FreeRTOS.h"
+#include "task.h"
+#include "semphr.h"
+#include "freertos-timer-board.h"
 #include "pico/time.h"
+#else
+#include "pico/time.h"
+#endif
 
 #include "board.h"
 #include "rtc-board.h"
@@ -98,6 +107,27 @@ static LmHandlerAppData_t AppData =
     .BufferSize = 0,
     .Port = 0,
 };
+
+#if USE_FREERTOS
+/*!
+ * FreeRTOS synchronization primitives
+ */
+static SemaphoreHandle_t xLoRaWANMutex = NULL;
+static SemaphoreHandle_t xTxDoneSemaphore = NULL;
+static SemaphoreHandle_t xRxDoneSemaphore = NULL;
+static TaskHandle_t xLoRaWANTaskHandle = NULL;
+
+/*!
+ * LoRaWAN task stack size and priority
+ */
+#define LORAWAN_TASK_STACK_SIZE     3072
+#define LORAWAN_TASK_PRIORITY       (tskIDLE_PRIORITY + 2)
+
+/*!
+ * LoRaWAN task function
+ */
+static void prvLoRaWANTask(void *pvParameters);
+#endif
 
 static void OnMacProcessNotify( void );
 static void OnNvmDataChange( LmHandlerNvmContextStates_t state, uint16_t size );
@@ -204,6 +234,20 @@ const char* lorawan_default_dev_eui(char* dev_eui)
 
 int lorawan_init(const struct lorawan_sx1276_settings* sx1276_settings, LoRaMacRegion_t region)
 {
+#if USE_FREERTOS
+    // Initialize FreeRTOS synchronization primitives
+    xLoRaWANMutex = xSemaphoreCreateMutex();
+    xTxDoneSemaphore = xSemaphoreCreateBinary();
+    xRxDoneSemaphore = xSemaphoreCreateBinary();
+    
+    if (xLoRaWANMutex == NULL || xTxDoneSemaphore == NULL || xRxDoneSemaphore == NULL) {
+        return -1;
+    }
+    
+    // Initialize FreeRTOS timers
+    FreeRTOSTimerInit();
+#endif
+
     EepromMcuInit();
 
     RtcInit();
@@ -241,6 +285,14 @@ int lorawan_init(const struct lorawan_sx1276_settings* sx1276_settings, LoRaMacR
     // The LoRa-Alliance Compliance protocol package should always be
     // initialized and activated.
     LmHandlerPackageRegister( PACKAGE_ID_COMPLIANCE, &LmhpComplianceParams );
+
+#if USE_FREERTOS
+    // Create the LoRaWAN background task
+    if (xTaskCreate(prvLoRaWANTask, "LoRaWAN", LORAWAN_TASK_STACK_SIZE, NULL, 
+                   LORAWAN_TASK_PRIORITY, &xLoRaWANTaskHandle) != pdPASS) {
+        return -1;
+    }
+#endif
 
     return 0;
 }
@@ -345,6 +397,14 @@ int lorawan_send_confirmed(const void* data, uint8_t data_len, uint8_t app_port)
     return 0;
 }
 
+#ifdef USE_FREERTOS
+int lorawan_send_confirmed_wait(const void* data, uint8_t data_len, uint8_t app_port, uint32_t timeout_ms)
+{
+    // Under FreeRTOS, delegate to the RTOS-aware send which uses semaphores
+    // and the library's background LoRaWAN task for precise RX window timing.
+    return lorawan_send_freertos(data, data_len, app_port, true, timeout_ms);
+}
+#else
 int lorawan_send_confirmed_wait(const void* data, uint8_t data_len, uint8_t app_port, uint32_t timeout_ms)
 {
     LmHandlerAppData_t appData;
@@ -369,6 +429,7 @@ int lorawan_send_confirmed_wait(const void* data, uint8_t data_len, uint8_t app_
 
     return LastConfirmedMessageAcked ? 0 : -2; // -2 means timeout/no ACK
 }
+#endif
 
 int lorawan_receive(void* data, uint8_t data_len, uint8_t* app_port)
 {
@@ -422,6 +483,51 @@ int lorawan_erase_nvm()
     EepromMcuFlush();
 
     return 0;
+}
+
+int lorawan_get_devaddr(uint32_t* devaddr)
+{
+    if (devaddr == NULL) {
+        return -1;
+    }
+    MibRequestConfirm_t mibReq;
+    mibReq.Type = MIB_DEV_ADDR;
+    if (LoRaMacMibGetRequestConfirm(&mibReq) != LORAMAC_STATUS_OK) {
+        return -1;
+    }
+    *devaddr = mibReq.Param.DevAddr;
+    return 0;
+}
+
+int lorawan_get_adr_enabled(int* adr_enabled)
+{
+    if (adr_enabled == NULL) {
+        return -1;
+    }
+    MibRequestConfirm_t mibReq;
+    mibReq.Type = MIB_ADR;
+    if (LoRaMacMibGetRequestConfirm(&mibReq) != LORAMAC_STATUS_OK) {
+        return -1;
+    }
+    *adr_enabled = (mibReq.Param.AdrEnable != 0); 
+    return 0;
+}
+
+int lorawan_last_ack_received(void)
+{
+#if USE_FREERTOS
+    // Take mutex briefly to read the flag consistently if initialized
+    if (xLoRaWANMutex) {
+        if (xSemaphoreTake(xLoRaWANMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            bool ack = LastConfirmedMessageAcked;
+            xSemaphoreGive(xLoRaWANMutex);
+            return ack ? 1 : 0;
+        }
+    }
+    return LastConfirmedMessageAcked ? 1 : 0;
+#else
+    return LastConfirmedMessageAcked ? 1 : 0;
+#endif
 }
 
 static void OnMacProcessNotify( void )
@@ -658,6 +764,11 @@ static void OnTxData( LmHandlerTxParams_t* params )
     if (params->IsMcpsConfirm == 1) {
         LastConfirmedMessageAcked = (params->AckReceived == 1);
     }
+    
+#if USE_FREERTOS
+    // Signal TX completion (called from task context)
+    xSemaphoreGive(xTxDoneSemaphore);
+#endif
 }
 
 static void OnRxData( LmHandlerAppData_t* appData, LmHandlerRxParams_t* params )
@@ -673,10 +784,10 @@ static void OnRxData( LmHandlerAppData_t* appData, LmHandlerRxParams_t* params )
         AppRxData.Port = appData->Port;
     }
     
-    // Track ACK reception for confirmed messages
-    if (params->RxSlot != RX_SLOT_NONE) {
-        LastConfirmedMessageAcked = true;
-    }
+#if USE_FREERTOS
+    // Signal RX completion (called from task context)
+    xSemaphoreGive(xRxDoneSemaphore);
+#endif
 }
 
 static void OnClassChange( DeviceClass_t deviceClass )
@@ -745,3 +856,109 @@ static void OnPingSlotPeriodicityChanged( uint8_t pingSlotPeriodicity )
 {
     LmHandlerParams.PingSlotPeriodicity = pingSlotPeriodicity;
 }
+
+#if USE_FREERTOS
+/*!
+ * LoRaWAN background task - handles MAC processing
+ */
+static void prvLoRaWANTask(void *pvParameters)
+{
+    (void)pvParameters;
+    
+    for (;;) {
+        // Take mutex before processing LoRaWAN
+        if (xSemaphoreTake(xLoRaWANMutex, portMAX_DELAY) == pdTRUE) {
+            
+            // Process LoRaWAN MAC layer
+            LmHandlerProcess();
+            
+            // Release mutex
+            xSemaphoreGive(xLoRaWANMutex);
+        }
+        
+    // Process frequently to meet RX1/RX2 timing
+    vTaskDelay(pdMS_TO_TICKS(2));
+    }
+}
+
+/*!
+ * FreeRTOS-compatible send function with timeout
+ */
+int lorawan_send_freertos(const void* data, size_t data_len, uint8_t app_port, bool confirmed, uint32_t timeout_ms)
+{
+    int result = -1;
+    
+    // Take mutex before sending
+    if (xSemaphoreTake(xLoRaWANMutex, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
+        
+        // Prepare data
+        AppData.Buffer = (uint8_t*)data;
+        AppData.BufferSize = data_len;
+        AppData.Port = app_port;
+        
+        LmHandlerParams.IsTxConfirmed = confirmed;
+        // Reset ACK flag before transmit
+        LastConfirmedMessageAcked = false;
+        // Clear any stale TX done notification
+        (void)xSemaphoreTake(xTxDoneSemaphore, 0);
+        
+        // Send the data
+    if (LmHandlerSend(&AppData, LmHandlerParams.IsTxConfirmed) == LORAMAC_HANDLER_SUCCESS) {
+            // Release mutex so LoRaWAN task can process and invoke callbacks
+            xSemaphoreGive(xLoRaWANMutex);
+
+            // Wait for TX cycle completion (frame transmitted and RX windows scheduled)
+            if (xSemaphoreTake(xTxDoneSemaphore, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
+                if (confirmed) {
+                    // For confirmed messages, AckReceived may only be known after RX1/RX2.
+                    // OnTxData sets LastConfirmedMessageAcked only when MCPS-Confirm callback
+                    // provides IsMcpsConfirm == 1. Some stacks set Ack after RX windows close,
+                    // which can be slightly later than the TxDone semaphore release.
+                    // Actively wait (bounded) for ACK flag to settle or RX completion.
+                    TickType_t startTick = xTaskGetTickCount();
+                    const TickType_t rxWindowGuardTicks = pdMS_TO_TICKS(2500); // Guard for RX1+RX2
+                    while (!LastConfirmedMessageAcked && (xTaskGetTickCount() - startTick) < rxWindowGuardTicks) {
+                        // If a downlink arrives, OnRxData will set LastConfirmedMessageAcked (if it was an ACK)
+                        // Give other tasks chance to run
+                        vTaskDelay(pdMS_TO_TICKS(25));
+                    }
+                    result = LastConfirmedMessageAcked ? 0 : -2; // -2 => no ACK received within RX windows
+                } else {
+                    result = 0; // Unconfirmed success
+                }
+            } else {
+                // Timed out waiting for TX/confirm event altogether
+                result = -3;
+            }
+            return result;
+        }
+        // Send failed immediately; release mutex and return
+        xSemaphoreGive(xLoRaWANMutex);
+    }
+    
+    return result;
+}
+
+/*!
+ * FreeRTOS-compatible join function with timeout
+ */
+int lorawan_join_freertos(uint32_t timeout_ms)
+{
+    int result = -1;
+    
+    // Take mutex before joining
+    if (xSemaphoreTake(xLoRaWANMutex, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
+        
+        // Start join procedure
+        LmHandlerJoin();
+        
+        // Join was initiated successfully
+        result = 0;
+        
+        // Release mutex
+        xSemaphoreGive(xLoRaWANMutex);
+    }
+    
+    return result;
+}
+#endif /* USE_FREERTOS */
